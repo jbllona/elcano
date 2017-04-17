@@ -24,7 +24,10 @@ data from C6 Navigator
 */
 
 SerialData serialData;
+SerialData command;
+
 ParseState parseState;
+
 
 
 volatile long odo_mm = 0; // this is used by the interrupt 
@@ -52,6 +55,9 @@ struct Point
   double x;
   double y;
 };
+
+Point location;   // holds the current position of the trike
+int bearing_deg;  // holds the bearing position of the trike
 
 struct Turn
 {
@@ -851,36 +857,53 @@ void moveFixedDistanceWheelRev(long distance_mm)
   command.write(&Serial1);
 }
 
-void incrementDistance()
+void incrementDistance() // called by an interrupt
 {
-  odo_mm += WHEEL_CIRCUM_MM / 4;
+  odo_mm += WHEEL_CIRCUM_MM / 2; // 2 magents on wheel
 }
 
-
-void go10NorthNoCubic()
+int bearingToTarget(Point start, Point end)
 {
-  long startX = 0;
-  long startY = 0;
-  int startBearing;
-  while(true)
+  int bearing = atan((end.y-start.y)/(end.x-start.x))* (180/PI);
+  
+  if(end.x >= start.x) // should be from 0 to 90 (in other order)
   {
-    ParseStateError r = parseState.update();
-    if(r == ParseStateError::success)
-    {
-      break;
-    }
-    else Serial.println(static_cast<int8_t>(r));
+    bearing *= -1;
+    bearing += 90;
   }
+  else if(end.x < start.x) // should be from 270 to 359
+  {
+    bearing *= -1;
+    bearing += 270;
+  }
+  return bearing;
+}
 
-  TargetLocation target; // temp, will be replaced by C4 input
-  target.northPos = startY + 1000;
-  target.eastPos = startX;
-  target.bearing = 0;
-  target.targetSpeed_cmPs = 0;
+float pythagoreanDistance(Point start, Point end)
+{
+  return sqrt(sq(end.x-start.x) + sq(end.y-start.y));
+}
 
-
-  int deg = ShortestAngle(serialData.bearing_deg, target.bearing);
-  while(1)Serial.println(deg);
+void navigateToPoint(Point endPoint)
+{
+  while(abs(bearingToTarget(location, endPoint) - bearing_deg) > 3) // tolerate a 3 degree error
+  {
+    turn(ShortestAngle(bearing_deg, bearingToTarget(location, endPoint)));
+    
+    while(true)
+    {
+      Serial.println("waiting for location");
+      ParseStateError r = parseState.update();
+      if(r == ParseStateError::success)
+      {
+        location.x = serialData.posE_cm;
+        location.y = serialData.posN_cm;
+        bearing_deg = serialData.bearing_deg; 
+        break;
+      }
+    }
+    moveFixedDistance(pythagoreanDistance(location, endPoint), 2000);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -912,7 +935,24 @@ void setup()
   pinMode(8,OUTPUT);
   attachInterrupt(digitalPinToInterrupt(2), incrementDistance, RISING);
 
-  moveFixedDistance(1000, 5000);
+  Point start, end;
+  start.x = 0;
+  start.y = 0;
+  end.x = 1000;
+  end.y = 1000;
+
+  while(true)
+  {
+    Serial.println("waiting for initial location");
+    ParseStateError r = parseState.update();
+    if(r == ParseStateError::success)
+    {
+      location.x = serialData.posE_cm;
+      location.y = serialData.posN_cm;
+      bearing_deg = serialData.bearing_deg; 
+      break;
+    }
+  }
 }
 
 void loop() 
@@ -921,17 +961,16 @@ void loop()
   ParseStateError r = parseState.update();
   if(r == ParseStateError::success)
   {
-    Serial.print(serialData.posN_cm);
-    Serial.print("\t");
-    Serial.println(serialData.posE_cm);
+    location.x = serialData.posE_cm;
+    location.y = serialData.posN_cm;
+    bearing_deg = serialData.bearing_deg;    
   }
-//  Serial.println(static_cast<int8_t>(r));
   //-----------------------Output to C2-----------------------//
-  serialData.clear();
-  serialData.kind = MsgType::drive;
-  serialData.angle_mDeg = 0;
-  serialData.speed_cmPs = 0;
-  serialData.write(&Serial1);
+  command.clear();
+  command.kind = MsgType::drive;
+  command.angle_mDeg = 0;
+  command.speed_cmPs = 0;
+  command.write(&Serial1);
 
   delay(100);
 
