@@ -510,7 +510,6 @@ void noCompasTurn(int degrees)
   float distance_mm = TURN_CIRCUMFERENCE_CM / (360/degrees);
   long odo_target = odo_mm + distance_mm;
   
-  SerialData command;
   command.kind = MsgType::drive;
 
   command.speed_cmPs = 0;
@@ -535,21 +534,7 @@ void noCompasTurn(int degrees)
 // turn a number of degrees. Positive number for left, negative for right
 void turn(int turnAmount)
 {
-    SerialData command;
     command.kind = MsgType::drive;
-    while(true) // wait until information on the bearing is recieved by C6
-    {
-      ParseStateError r = parseState.update();
-      if(r == ParseStateError::success)
-      {
-        Serial1.end();
-        Serial1.begin(baudrate);  // clear the buffer
-        break;
-      }
-      Serial.println("waiting for comms");
-    }
-
-    int initialBearing = serialData.bearing_deg;
  
     // send a slow speed to C2 and either a left or a right turn
     command.speed_cmPs = 0;
@@ -578,11 +563,11 @@ void turn(int turnAmount)
       ParseStateError r = parseState.update();
       if(r == ParseStateError::success)
       {
-        currentBearing = abs((serialData.bearing_deg - initialBearing));
+        currentBearing = abs((serialData.bearing_deg - bearing_deg));
         if(currentBearing > (360-turnAmount) 
         && oldBearing < turnAmount 
-        && (initialBearing <= turnAmount 
-        || initialBearing >= (360 - turnAmount)))
+        && (bearing_deg <= turnAmount 
+        || bearing_deg >= (360 - turnAmount)))
         {
           currentBearing %= 180; 
         }
@@ -618,68 +603,40 @@ void squareRoutine(){
 void moveFixedDistance(long length_mm, long speed_mms)
 { 
   Serial.println("starting move fixed distance");
-  while(true)
-  {
-    ParseStateError r = parseState.update();
-    Serial.println("waiting for initial location: " + String(static_cast<int8_t>(r)));
-    if(r == ParseStateError::success)
-    {
-      Serial.println("got initial location");
-      break;
-    }
-  }
-  double initialDistance_cm = sqrt(abs(abs(serialData.posE_cm) * abs(serialData.posE_cm) + abs(serialData.posN_cm) * abs(serialData.posN_cm)));
-  serialData.clear();
-  serialData.kind = MsgType::drive;
-  serialData.speed_cmPs = speed_mms/10; // The initial speed to send.
-  serialData.angle_mDeg = 0; // what should this actually be
-  serialData.write(&Serial1);
+  double initialDistance_cm = sqrt(sq(location.x) + sq(location.y));
+  
+  command.clear();
+  command.kind = MsgType::drive;
+  command.speed_cmPs = speed_mms/10; // The initial speed to send.
+  command.angle_mDeg = 0; // what should this actually be
+  command.write(&Serial1);
 
   double currentDistance_cm = 0;
   double length_cm = length_mm / 10;
+  
   while(currentDistance_cm < length_cm + initialDistance_cm){
+    
     ParseStateError r = parseState.update();
     if(r == ParseStateError::success){
-      double currentLocation_cm = sqrt(abs(abs(serialData.posE_cm) * abs(serialData.posE_cm) + abs(serialData.posN_cm) * abs(serialData.posN_cm)));
-      Serial.println(currentLocation_cm);
+      location.x = serialData.posE_cm;
+      location.y = serialData.posN_cm;
+      
+      double currentLocation_cm = sqrt(sq(location.x) + sq(location.y));
+
       double delta_cm = abs(currentLocation_cm - initialDistance_cm);
       currentDistance_cm += delta_cm;
-//      Serial.println("Current: " + String(currentDistance_cm));
 
     }    
   }
-  Serial.println("Done moving fixed distance");
-  serialData.kind = MsgType::drive;
-  serialData.speed_cmPs = 0;
-  serialData.angle_mDeg = 0;
-  serialData.write(&Serial1);
-}
-
-
-/* This function will rotate the bike to the desired angle. 
- * This includes calculation of the difference in its current heading and the 
- * target angle. Low level commands will be sent to C2 low level controller. 
- */
-void RotateToAngle(int targetAngle, int currentHeading)
-{
-  //We must know full turing angle and lowest speed
-  //calculate angle distance and decide which direction to turn
-
-  //Have we reached our target?
-  if(targetAngle == currentHeading)
-  {
-    return;
-  }
-
-  //if not we set the steering angle and conitune turning.
-  if(ShortestAngle(targetAngle, currentHeading))
-  {
-  }
-
-  //was is our max steering angle?
   
-  //test with turn around twice.   
+  command.kind = MsgType::drive;
+  command.speed_cmPs = 0;
+  command.angle_mDeg = 0;
+  command.write(&Serial1);
 }
+
+
+
 
 /* The Float Comparison function allows you to compare floats to any X number 
  * of decimal places. This allows us to compare two floats without errors
@@ -845,7 +802,7 @@ bool ValidRange(float x1,float y1, float x2,float y2, float range)
 void moveFixedDistanceWheelRev(long distance_mm)
 {
   long target_mm = odo_mm + distance_mm;
-  SerialData command;
+
   command.kind = MsgType::drive;
   command.speed_cmPs = 200;
   command.angle_mDeg = 0;
