@@ -593,11 +593,11 @@ void loop()
     data.bearing_deg = CurrentHeading / HEADING_PRECISION;
     data.angle_mDeg = 0;
 
-//    Serial.println(String(fuzzy_out.x_Pos) + ", " + String(fuzzy_out.y_Pos));
+    Serial.println(String(newPos.x_Pos) + ", " + String(newPos.y_Pos));
     data.write(&Serial2);
 
   }
-  else Serial.println("noComs");
+  else Serial.println("noComs " + String(static_cast<int8_t>(r)));
     //data.write(&Serial2);
     //C2_Results.write(&Serial2);   
     
