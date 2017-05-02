@@ -91,10 +91,9 @@
 
 #include <avr/wdt.h> // Watch Dog Timer (Allows me to reboot the Arduino)
 
-const int SCALE_FACTOR = 58;   //to calculate the distance, use the scale factor of 58us per cm
+#include <SPI.h>
 
-// SPI Slave Communications
-enum SPI_COMMAND : byte { INITIAL = 14, INDEX, LSB, MSB, INCREMENT, END }; //SPI Command list
+const int SCALE_FACTOR = 58;   //to calculate the distance, use the scale factor of 58us per cm
 
 char receive_buffer[100];           // buffer to store input commands
 
@@ -111,7 +110,7 @@ volatile bool timeStartSet;
 volatile int isr1Count, isr2Count, isr3Count;
 volatile byte SignalsReceived;
 
-
+enum SPI_COMMAND : byte { INITIAL = 14, INDEX, LSB, MSB, INCREMENT, END }; //SPI Command list
 //For Sonar Data and Sample Storage
 enum SONAR : byte { S01, S02, S03, S06, S09, S10, S11, S12 }; //Sonar list
 
@@ -128,8 +127,8 @@ void setup()
 {
     //Baud rate configured for 115200
     //It communicates on digital pins 0 (RX) and 1 (TX) as well as with the computer via USB
+    #define DEBUG_MODE false
     Serial.begin(BAUD_RATE);
-
     if (DEBUG_MODE)
     {
         //DEBUG LED test
@@ -138,19 +137,20 @@ void setup()
     }
     else
     {
+        SPI.begin();
+        pinMode(MOSI, INPUT);
+        pinMode(SS, INPUT);
         //Serial Peripheral Interface (SPI) Setup
         pinMode(MISO, OUTPUT); // have to send on master in, *slave out*
 
         //SPI Control Register (SPCR)
         SPCR |= _BV(SPE);   //Turn on SPI in slave mode (SPI Enable)
-        SPCR |= _BV(SPIE);  //Turn on interrupts for SPI (SPI Interrupt Enable) 
-
+        SPI.attachInterrupt();
         // get ready for an interrupt 
         position = 0;               // buffer empty
         process_command = false;    //False until we have a request to process
         data_index = 1;             //start the array index at 1
     }  
- 
     pinMode(S_DEC1, OUTPUT);        //Pin 5 (PWM)       --> SD1
     pinMode(S_DEC2, OUTPUT);        //Pin 6 (PWM/A7)    --> SD2
 
@@ -317,6 +317,13 @@ void setRound(int highOrderBit, int lowOrderBit)
     }
 }
 
+void clearRangeData()
+{
+    for (int index = 1; index < RANGE_DATA_SIZE; index++)
+    {
+        range[index] = 0;
+    }    
+}
 
 // -------------------------------------------------------------------------------------------------
 void delayPeriod(byte expectedSingal)
@@ -331,3 +338,270 @@ void delayPeriod(byte expectedSingal)
 
     timeStartSet = false;
 }
+
+
+
+
+/*
+ * Interrupts on SPI slave select from C3
+ * 
+ * Recieve a number from C3, corresponding to the O'clock position
+ * of the sonar it wants data from, then we send first byte of that data
+ * 
+ * A -1 (or 255) is recieved to signal that we need to send the second byte of 
+ * data to C3.
+ */
+
+volatile int index = 0; // used to keep track of most recent command from C3
+ISR(SPI_STC_vect)
+{
+    noInterrupts();
+    byte c = SPDR; // store incoming byte
+    if(c != 255) // if a command is recieved
+    {
+      index = c; // save globally
+      SPDR = range[index] >> 8; // sends first byte of data
+    }
+    else // if a 255 is recieved
+    {
+      SPDR = range[index] & 0x00FF; // sends second byte of data
+    }
+    interrupts();
+}  // end of interrupt routine SPI_STC_vect
+
+
+// -------------------------------------------------------------------------------------------------
+void ISRLeft()
+{  
+    //ISR for end of pulse on sonar 9, 10 or 11    
+    noInterrupts();
+
+    isr1Count++;
+
+    //if (digitalRead(PW_OR3) == HIGH && timeStartSet == false)
+    if (ibh(PINE, PE6) && !timeStartSet)
+    {
+        timeStartSet = true;      
+        timeStart = micros();
+    }
+    else
+    {
+        timeLeft = micros();        
+        SignalsReceived++;
+    }
+    interrupts();
+}
+
+
+// -------------------------------------------------------------------------------------------------
+void ISRCenter()
+{  
+    //ISR for end of pulse on sonar 6 or 12
+    noInterrupts();
+
+    isr2Count++;
+
+    //if (digitalRead(PW_OR1) == HIGH && timeStartSet == false)
+    if (ibh(PIND, PD0) && !timeStartSet)
+    {
+        timeStart = micros();
+        timeStartSet = true;
+    }
+    else
+    {
+        timeCenter = micros();        
+        SignalsReceived++;
+    }
+
+    interrupts();
+ }
+ 
+
+// -------------------------------------------------------------------------------------------------
+void ISRRight()
+{
+    //ISR for end of pulse on sonar 1, 2 or 3
+    noInterrupts(); 
+
+    isr3Count++; 
+
+    //if (digitalRead(PW_OR2) == HIGH && timeStartSet == false)
+    if (ibh(PIND, PD1) && !timeStartSet)
+    {
+        timeStart = micros();
+        timeStartSet = true;
+    }
+    else
+    {
+        timeRight = micros();        
+        SignalsReceived++;
+    }
+    interrupts();
+}
+
+void processCommand()
+{
+    String currentCommand;
+    for (int i = 0; i < position; i++)
+    {
+        currentCommand += receive_buffer[i];
+    }
+    position = 0;
+
+    //COMMAND: Enable all the sonars on the sonar board
+    if (currentCommand == "enable all")
+    {
+        Serial.println("ENABLE ALL");
+
+        //Enable all sonars ON
+        controlSwitch = 0xFF;
+    }
+
+    //COMMAND: Rebooting the Arduino
+    else if (currentCommand == "reboot")
+    {
+        Serial.print(F("Rebooting Arduino"));
+        for (int i = 0; i < 8; i++)
+        {
+            Serial.print(F("."));
+            delay(250);
+        }
+        Serial.println(F("GOODBYE"));
+
+        software_Reboot();
+    }
+
+    //Get the length of the command header
+    int headerLength = currentCommand.indexOf(":");
+
+    //Parse out the command header
+    String commandHeader = currentCommand.substring(0, headerLength);
+
+    //Parse out the command value
+    String commandValue = currentCommand.substring(headerLength + 1);
+
+    //COMMAND:Narrow the sonar focus on the sonar board
+    if (commandHeader == "narrow focus")
+    {
+        if (commandValue == "left")
+        {
+            Serial.println("LEFT");
+            controlSwitch = 0x70; //Enable sonars 9, 10, 11 on
+
+        }
+        else if (commandValue == "center")
+        {
+            Serial.println("CENTER");
+            controlSwitch = 0xC1; //Enable sonars 11, 12, 1 on
+
+        }
+        else if (commandValue == "right")
+        {
+            Serial.println("RIGHT");
+            controlSwitch = 0x07; //Enable sonars 1, 2, 3 on
+
+        }
+
+        //Clear array data before after changing any configuration
+        clearRangeData();
+    }
+
+    //COMMAND:Single a sonar to read on the sonar board
+    else if (commandHeader == "single mode")
+    {
+        int sonar = commandValue.toInt();
+
+        if (valueToClockPosition(sonar) >= 0)
+        {
+            Serial.print("SINGLE MODE [");
+            Serial.print(sonar);
+            Serial.println("]");
+
+            controlSwitch = 0x00;
+            sbi(controlSwitch, sonar);
+            clearRangeData();
+        }
+    }
+
+    //COMMAND:Toggle a sonar ON or OFF
+    else if (commandHeader == "toggle radar")
+    {
+        int sonar = commandValue.toInt();
+
+        if (valueToClockPosition(sonar) >= 0)
+        {
+            Serial.print("TOGGLE RADAR[");
+            Serial.print(sonar);
+            Serial.println("]");
+
+            tbi(controlSwitch, sonar);
+            clearRangeData();
+        }
+    }
+}
+
+void writeOutput()
+{
+    if (DEBUG_MODE) 
+    { 
+        // if (VERBOSE_DEBUG)
+        // {
+        //     Serial.print(F("Round: "));     Serial.print(roundCount);
+        //     Serial.print(F(" micros: "));   Serial.print(micros());
+           
+        //     Serial.print(F(", micros since last: "));
+        //     Serial.print(micros() - timeSinceLastRound);
+        //     timeSinceLastRound = micros();
+            
+        //     Serial.print(F(", SigReceived: ")); Serial.print(SignalsReceived);
+        //     Serial.print(F(", isr1: "));        Serial.print(isr1Count);
+        //     Serial.print(F(", isr2: "));        Serial.print(isr2Count);
+        //     Serial.print(F(", isr3: "));        Serial.println(isr3Count);
+        // }
+
+        for (int index = 1; index < RANGE_DATA_SIZE; index++)
+        {
+            if (VERBOSE_DEBUG)
+            {
+                //Prints out only the sonars for one board (9, 10, 11, 12, 1, 2, 3)
+                if (index == 4 || index == 5 || index == 7 || index == 8) { continue; }
+                // if (bitRead(controlSwitch, valueToClockPosition(index))) { continue; }
+
+                if (index < 10) { Serial.print(F("[ ")); }
+                else { Serial.print(F("[")); }
+
+                Serial.print(index);
+                Serial.print(F("]\t"));
+
+                for (int position = 0; position < SAMPLE_DATA_SIZE; position++)
+                {
+                    Serial.print(sampleRange[index][position]);
+                    Serial.print(F("\t"));
+                }
+                Serial.print(F("\t"));
+            }
+           
+            quicksort(sampleRange, index, 0, SAMPLE_DATA_SIZE - 1); //Quicksort
+
+            Serial.print(findMode(sampleRange, index, SAMPLE_DATA_SIZE));
+            
+            if (VERBOSE_DEBUG) { Serial.println(); }
+            else { Serial.print(F(" ")); }
+            
+        }
+        Serial.println();
+    }
+
+    else
+    {
+        for (int index = 1; index < RANGE_DATA_SIZE; index++)
+        {
+            quicksort(sampleRange, index, 0, SAMPLE_DATA_SIZE - 1); //Quicksort
+            range[index] = findMode(sampleRange, index, SAMPLE_DATA_SIZE);
+        }
+
+        showBinaryControlSwitch();
+    }
+}
+
+

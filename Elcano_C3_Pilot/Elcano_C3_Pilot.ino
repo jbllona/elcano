@@ -3,6 +3,9 @@
 #include <ElcanoSerial.h>
 #include <SPI.h>
 #include <Settings.h>
+
+#define SLAVE_SELECT_C5 SS
+
 using namespace elcano;
 /*
 // Elcano Contol Module C3: Pilot.
@@ -866,7 +869,7 @@ void navigateToPoint(Point endPoint)
 ////////////////////////////////////////////////////////////////////////////////
 void setup() 
 {  
-
+  setupTimer();
   Serial.begin(9600);
   Serial1.begin(baudrate);
   /* 
@@ -883,6 +886,11 @@ void setup()
     digitalWrite(13,LOW); 
     delay(800);
   }
+
+  pinMode(SLAVE_SELECT_C5, OUTPUT);
+  digitalWrite(SLAVE_SELECT_C5, HIGH);
+  SPI.begin(); 
+  setupTimer();
   
   parseState.dt       = &serialData;
   parseState.input    = &Serial1;
@@ -931,4 +939,52 @@ void loop()
 
   delay(100);
 
+}
+
+
+
+// OBSTICAL DETECTION CODE
+
+/*
+ * Uses timer register 1 to make an interrupt fire periodically
+ * this interrupt is used to get data from C5
+ */
+void setupTimer()
+{
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+
+  int frequencyHz = 100; // interrupt fires 100 times a second
+
+  OCR1A = 16000000l/(frequencyHz*/*1024*/256)-1;
+
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS12)|(/*1*/0 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+  interrupts();
+}
+
+volatile int data[14]; // used to store data from the sonars
+volatile int current = 0;
+ISR(TIMER1_COMPA_vect)
+{
+  noInterrupts();
+  
+  digitalWrite(SLAVE_SELECT_C5, LOW);
+  byte rhs = SPI.transfer(current == 12 ? 0 : current);
+  digitalWrite(SLAVE_SELECT_C5, HIGH);
+  
+  delay(1);
+  
+  digitalWrite(SLAVE_SELECT_C5, LOW);
+  byte lhs = SPI.transfer(-1);
+  digitalWrite(SLAVE_SELECT_C5, HIGH);
+  data[current] = lhs << 8 | rhs;
+
+  current++;
+  if(current > 13) current = 1;
+  
+  interrupts();
 }
