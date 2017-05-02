@@ -592,9 +592,9 @@ void squareRoutine(){
   long speed_mms = 5000;      // default value
   Serial.println("Begin square");
   for(int i = 0; i < 4; i++){
-    moveFixedDistanceWheelRev(length_mm);
+    moveFixedDistance(length_mm, 2000);
     delay(5000);
-    noCompasTurn(90);
+    turn(90);
     Serial.println("Side " + String(i+1) + " completed");
     delay(5000);
     Serial.println(++num);
@@ -918,6 +918,13 @@ void setup()
       break;
     }
   }
+  
+  
+//  squareRoutine();
+  Point destination;
+  destination.x = location.x;
+  destination.y = location.y + 1000;
+  navigateToPoint(destination);
 }
 
 void loop() 
