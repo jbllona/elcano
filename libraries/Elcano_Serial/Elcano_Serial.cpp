@@ -1,190 +1,1071 @@
 #include "Elcano_Serial.h"
+#include "Arduino.h"
+#include <FastCRC.h>
+#include <math.h>
 
-/*
-** Elcano_Serial.cpp
-** By Dylan Katz
-** Paul Curry, Jan 3, 2017
-** Manages our protocal for robust communication of SerialData over serial connections.
-* Note: Sends serial data through the port passed in the write function and reads serial data from the port set to be
-* dev.
-*/
+FastCRC8 CRC8;
+char buffer[64];      //used to collect strings from Sender 
+int intBuffer[64];    //used to convert string number back to int 
+int intBuffInx = 0;   //index for intBuff
+int attriValue[5];
+int i = 0;
+int newCRC = 0;
 
+// Elcano_Serial.h
+// By HUY NGUYEN 
+// 
+// Manages our protocal for robust communication of SerialData over serial
+// connections. Complete documentation and usage is on the wiki.
 namespace elcano {
+  ParseStateError ParseState::update(void) {
+      Serial.println("HELLO**************************************");
+      /*CLEAN BUFFERS*/
+      newCRC =0;
+      for(int j = 0; j<64;j++){
+      attriValue[j]=NaN;
+      }
+      for(int j = 0; j<5;j++){
+      buffer[j]=NaN;
+      }
+      for(int j = 0; j<64;j++){
+      intBuffer[j]=NaN;
+      }
+      /*COLLECT GOOD DATA*/
+      for(i = 0; i<64;i++){
+        buffer[i]= input->read();
+        if (buffer[i] == -1) return ParseStateError::unavailable;
+        if (buffer[i] == '\t' || buffer[i] == '\0' || buffer[i] == '\r' ){ 
+          return ParseStateError::noise_in_data ;
+        }
+        if(buffer[i] =='D' ||buffer[i] =='G'|| buffer[i] =='S' ||buffer[i] =='X'){
+          i = 0;
+        }
+        if(buffer[i]=='\n'){  //the previous entry of buffer is not an attribute
+          i++;
+          break;
+        }
+        Serial.print(buffer[i]);
+      }
+      Serial.println("");
+      Serial.println("ACTUAL ACCEPTED BUFFER:");
+      for(int j = 0; j<i ; j++){
+        Serial.print(buffer[j]);
+      }
+      Serial.println("RESULT:");
+      if(buffer[0] == 'D'){
+        return checkDrive();
+      }else if(buffer[0] == 'G'){
+        return checkGoal();
+      }else if(buffer[0] =='S') {
+        return checkSensor();
+      }else if(buffer[0] == 'X'){
+        return checkSeg();
+      }else{
+        Serial.println((char)buffer[0]);
+        return ParseStateError::bad_type;
+      }
+  }
+  bool SerialData::write(HardwareSerial * out){ 
+      String num="";
+      if(!verify()) return false;
+      int position = 0;
+      char buffer[64] ="";
+      //DRIVE STRING---------------------------
+      if(kind == MsgType::drive)
+      {
 
-/*
- * Begins to read serial data. Places data into its internal state
- * 
- * Returns a type ParseStateError which is an enum specifying which error if any
- * occured in the process.
- */
-ParseStateError ParseState::update(void) {
-	int c = dev->read();
-	if (c == -1) return ParseStateError::unavailable;
-	if (c == ' ' || c == '\t' || c == '\0' || c == '\r') return ParseStateError::incomplete;
-	switch(state) {
-	case 0:
-		// During this state, we begin the processing of a new SerialData
-		// packet and we must receive {D,S,G,X} to state which type of packet
-		// we are working with
-		dt->clear();
-		switch(c) {
-		case 'D': dt->kind = MsgType::drive;  break;
-		case 'S': dt->kind = MsgType::sensor; break;
-		case 'G': dt->kind = MsgType::goal;   break;
-		case 'X': dt->kind = MsgType::seg;    break;
-		default : return ParseStateError::bad_type;
-		}
-		state = 1;
-		return ParseStateError::incomplete;
-	case 1:
-		// During this state, we need to find '{' if we are reading the value
-		// for an attribute, or '\n' if we are done with the packet
-		switch(c) {
-		case '\n': state = 0; return dt->verify() ? ParseStateError::success : ParseStateError::inval_comb;
-		case '{' : state = 2; return ParseStateError::incomplete;
-		default  : return ParseStateError::bad_lcurly;
-		}
-	case 2:
-		// During this state, we begin reading an attribute of the SerialData
-		// and we must recieve {n,s,a,b,r,p} to state _which_ attribute
-		switch(c) {
-		case 'n': state = 3; dt->number      = 0; return ParseStateError::incomplete;
-		case 's': state = 4; dt->speed_cmPs  = 0; return ParseStateError::incomplete;
-		case 'a': state = 5; dt->angle_deg   = 0; return ParseStateError::incomplete;
-		case 'b': state = 6; dt->bearing_deg = 0; return ParseStateError::incomplete;
-		case 'r': state = 7; dt->probability = 0; return ParseStateError::incomplete;
-		case 'p': state = 8; dt->posE_cm = 0; dt->posN_cm = 0; return ParseStateError::incomplete;
-		default : return ParseStateError::bad_attrib;
-		}
-#define STATES(SS, PS, NS, TERM, HOME, VAR)   \
-    case SS:                                   \
-        if (c == '-') {                         \
-            state = NS;                          \
-            return ParseStateError::incomplete; } \
-        state = PS;                               \
-    case PS:                                      \
-        if (c >= '0' && c <= '9') {               \
-            dt->VAR *= 10;                        \
-            dt->VAR += c - '0';                   \
-            return ParseStateError::incomplete; } \
-        else if (c == TERM) {                     \
-            state = HOME;                         \
-            return ParseStateError::incomplete; } \
-        else                                      \
-            return ParseStateError::bad_number;   \
-    case NS:                                      \
-        if (c >= '0' && c <= '9') {               \
-            dt->VAR *= 10;                        \
-            dt->VAR -= c - '0';                   \
-            return ParseStateError::incomplete; } \
-        else if (c == TERM) {                     \
-            state = HOME;                         \
-            return ParseStateError::incomplete; } \
-        else                                      \
-            return ParseStateError::bad_number;
-STATES(3, 13, 23, '}', 1, number)
-STATES(4, 14, 24, '}', 1, speed_cmPs)
-STATES(5, 15, 25, '}', 1, angle_deg)
-STATES(6, 16, 26, '}', 1, bearing_deg)
-STATES(7, 17, 27, '}', 1, probability)
-STATES(8, 18, 28, ',', 9, posE_cm)
-STATES(9, 19, 29, '}', 1, posN_cm)
-#undef STATES
-	}
-}
+        //create the drive string as D{s speed_cmPS}{a angle_mDeg}CRC\n
+        
 
+        //D{s speed_cmPS}
+        buffer[position++] = 'D';
+        out->print('D');
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 's';
+        out->print('s');
+        buffer[position++] = ' ';
+        out->print(' ');
+    
+        num = String(speed_cmPs);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+       // buffer[position++] ='\n';
+        //{a angle_mDeg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'a';
+        out->print('a');
+        buffer[position++] = ' ';
+        out->print(' ');
+        num = String(angle_mDeg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+       
 
-/* Turns the given serial data into a protocal string
- *  and prints it to dev
- */
-bool SerialData::write(HardwareSerial *dev) {
-	switch (kind) {
-	case MsgType::drive:  dev->print("D"); break;
-	case MsgType::sensor: dev->print("S"); break;
-	case MsgType::goal:   dev->print("G"); break;
-	case MsgType::seg:    dev->print("X"); break;
-	default:         return false;
-	}
-	if (number != NaN && (kind == MsgType::goal || kind == MsgType::seg)) {
-		dev->print("{n ");
-		dev->print(number);
-		dev->print("}");
-	}
-	if (speed_cmPs != NaN && kind != MsgType::goal) {
-		dev->print("{s ");
-		dev->print(speed_cmPs);
-		dev->print("}");
-	}
-	if (angle_deg != NaN && (kind == MsgType::drive || kind == MsgType::sensor)) {
-		dev->print("{a ");
-		dev->print(angle_deg);
-		dev->print("}");
-	}
-	if (bearing_deg != NaN && kind != MsgType::drive) {
-		dev->print("{b ");
-		dev->print(bearing_deg);
-		dev->print("}");
-	}
-	if (posE_cm != NaN && posN_cm != NaN && kind != MsgType::drive) {
-		dev->print("{p ");
-		dev->print(posE_cm);
-		dev->print(",");
-		dev->print(posN_cm);
-		dev->print("}");
-	}
-	if (probability != NaN && kind == MsgType::goal) {
-		dev->print("{r ");
-		dev->print(probability);
-		dev->print("}");
-	}
-	dev->print("\n");
-	return true;
-}
+       // buffer[position]=0;      
+      }
+      //SENSOR STRING--------------------------
+      else if (kind == MsgType::sensor)
+      {
+        //create the sensor string as S{s speed_cmPS}{p posE_cm,posN_cm}{b bearing_deg}{a angle_mDeg}CRC\n
+        //S{s speed_cmPS}
+        buffer[position++] = 'S';
+        out->print('S');
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 's';
+        out->print('s');
+        buffer[position++] = ' ';
+        out->print(' ');
+        
+        num = String(speed_cmPs);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
 
-/* Sets MsgType to none and sets all data to NaN */
-void SerialData::clear(void) {
+        //{p posE_cm,posN_cm}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'p';
+        out->print('p');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(posE_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = ',';
+        out->print(',');
+
+         num = String(posN_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+
+        buffer[position++] = '}';
+        out->print('}');
+
+        //{b bearing_deg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'b';
+        out->print('b');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(bearing_deg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+
+        //{a angle_mDeg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'a';
+        out->print('a');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(angle_mDeg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+      }
+      //GOAL STRING --------------------------------
+      else if(kind == MsgType::goal)
+      {
+        //create the goal string as G{n number}{p posE_cm,posN_cm}{b bearing_deg}CRC\n
+        //G{n number}
+       // int position = 0;
+
+        buffer[position++] = 'G';
+        out->print('G');
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'n';
+        out->print('n');
+        buffer[position++] = ' ';
+        out->print(' ');
+        num = String(number);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+
+        //{p posE_cm,posN_cm}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'p';
+        out->print('p');
+        buffer[position++] = ' ';
+        out->print(' ');
+        num = String(posE_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = ',';
+        out->print(',');
+        num = String(posN_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+        //{b bearing_deg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'b';
+        out->print('b');
+        buffer[position++] = ' ';
+        out->print(' ');
+        num = String(bearing_deg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+      }
+      //SEG STRING -------------------------------
+      else if (kind == MsgType::seg)   
+      {
+        //create the seg string as X{n number}{p posE_cm,posN_cm}{b bearing_deg}{a angle_mDeg}CRC\n
+        //X{n number}
+        buffer[position++] = 'X'; 
+        out->print('X');    
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'n';
+        out->print('n');
+        buffer[position++] = ' ';
+        out->print(' ');
+        
+        String num = String(number);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+        //{p posE_cm,posN_cm}
+        buffer[position++] = '{'; 
+        out->print('{');   
+        buffer[position++] = 'p';
+        out->print('p');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(posE_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = ',';
+        out->print(',');
+
+        num = String(posN_cm);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+
+        buffer[position++] = '}';
+        out->print('}');
+
+        //{b bearing_deg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'b';
+        out->print('b');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(bearing_deg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+
+        //{a angle_mDeg}
+        buffer[position++] = '{';
+        out->print('{');
+        buffer[position++] = 'a';
+        out->print('a');
+        buffer[position++] = ' ';
+        out->print(' ');
+
+        num = String(angle_mDeg);
+        for(int i = 0; i < num.length(); i++)
+        {
+          buffer[position++] = num.charAt(i);
+          out->print(buffer[position-1]);
+        }
+        buffer[position++] = '}';
+        out->print('}');
+        
+      }
+      buffer[position] = 0;
+      out->print(CRC8.smbus(buffer, position));
+      out->print('\n');
+      return true;
+  }
+  void SerialData::clear(void) {
     kind        = MsgType::none;
     number      = NaN;
     speed_cmPs  = NaN;
-    angle_deg   = NaN;
+    angle_mDeg   = NaN;
     bearing_deg = NaN;
     posE_cm     = NaN;
     posN_cm     = NaN;
     probability = NaN;
-}
+  }
+  bool SerialData::verify() {
+    switch (kind) {
+    case MsgType::drive:
+      if (speed_cmPs  == NaN) return false;
+      if (angle_mDeg   == NaN) return false;
+      break;
+    case MsgType::sensor:
+      if (speed_cmPs  == NaN) return false;
+      if (posE_cm     == NaN) return false;
+      if (posN_cm     == NaN) return false;
+      if (bearing_deg == NaN) return false;
+      if (angle_mDeg   == NaN) return false;
+      break;
+    case MsgType::goal:
+      if (number      == NaN) return false;
+      if (posE_cm     == NaN) return false;
+      if (posN_cm     == NaN) return false;
+      if (bearing_deg == NaN) return false;
+      break;
+    case MsgType::seg:
+      if (number      == NaN) return false;
+      if (posE_cm     == NaN) return false;
+      if (posN_cm     == NaN) return false;
+      if (bearing_deg == NaN) return false;
+      if (speed_cmPs  == NaN) return false;
+      break;
+    default:
+      return false;
+    }
+    return true;
+  }
+  // SUPPORTING FUNCTIONS FOR UPDATE() 
+  bool ParseState::is_expectedChar(char c, char sample){
+    if(c == sample){
+      return true;
+    }
+    return false;
+  }
+  bool ParseState::is_Number(char c){
+    if(c>='0' && c <='9'){
+      return true;
+    }
+    return false;
+  }
+  int ParseState::char2Int(char c){
+    int value = c -'0';
+    return value;
+  }
+  int ParseState::intBuff2Int(int n){
+    int sum = 0;
+    int m = 0;
+    int k =0;
+    int testBuffRev[64];
+    for (int k = n; k>=0; k--){
+       testBuffRev[m] = intBuffer[k];
+       m++;
+    }
+    for(int j = 0; j< m; j++){
+      sum = sum + testBuffRev[j]*power(10,j);
+    }
+    return sum;
+  }
+  int ParseState::power(int base, int iexp){
+    int power = 1;
+    for(int j = 1; j<=iexp; j++){
+      power = power*base;
+    }
+    return power;
+  }
+  ParseStateError ParseState::checkDrive(void){
+    #pragma region
+      //check the  drive string
+      dt->kind = MsgType::drive;
+      Serial.println("Check Drive");
+      i =1;
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'s')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+    attriValue[0]= intBuff2Int(intBuffInx-1);//speed_cmPs
+    intBuffInx =0;
 
-/* Verifies that the MsgType does not have data values NaN that it shouldn't have */
-bool SerialData::verify(void) {
-	switch (kind) {
-	case MsgType::drive:
-		if (speed_cmPs  == NaN) return false;
-		if (angle_deg   == NaN) return false;
-		break;
-	case MsgType::sensor:
-		if (speed_cmPs  == NaN) return false;
-		if (posE_cm     == NaN) return false;
-		if (posN_cm     == NaN) return false;
-		if (bearing_deg == NaN) return false;
-		if (angle_deg   == NaN) return false;
-		break;
-	case MsgType::goal:
-		if (number      == NaN) return false;
-		if (posE_cm     == NaN) return false;
-		if (posN_cm     == NaN) return false;
-		if (bearing_deg == NaN) return false;
-		break;
-	case MsgType::seg:
-		if (number      == NaN) return false;
-		if (posE_cm     == NaN) return false;
-		if (posN_cm     == NaN) return false;
-		if (bearing_deg == NaN) return false;
-		if (speed_cmPs  == NaN) return false;
-		break;
-	default:
-		return false;
-	}
-	return true;
-}
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+        
+      if(!is_expectedChar(buffer[i],'{')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'a')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[1] = intBuff2Int(intBuffInx-1);//angle_mDeg
+      intBuffInx =0;
 
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        Serial.println('4');
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
 
+      //check CRC is a num 
+      while(buffer[i] != '\n'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+    attriValue[2] = intBuff2Int(intBuffInx-1);//CRC from received string
+    newCRC = CRC8.smbus(buffer,i-intBuffInx); //CRC generated by received string
+    Serial.println(newCRC);
+    intBuffInx = 0;
+
+    if(attriValue[2] == newCRC){
+      dt->speed_cmPs = attriValue[0];
+      dt->angle_mDeg = attriValue[1];
+      dt->crc = newCRC;
+    }else{
+      return ParseStateError::inval_comb;
+    }
+
+    //check the last item in String and confirm data is succesfully input 
+    if(is_expectedChar(buffer[i],'\n') && dt->verify()){
+      return ParseStateError::success;
+    }else{
+      return ParseStateError::inval_comb; 
+    }
+  }
+  ParseStateError ParseState::checkGoal(void){
+    //check the goal string 
+    #pragma region
+      Serial.println("Check Goal");
+      dt->kind = MsgType::goal;
+      i =1;
+   
+      //check_CurlyPack(1,'s');++++++++++++++++++++++++++
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'n')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+     
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+    
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+     
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[0] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+    
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+     
+      if(!is_expectedChar(buffer[i],'p')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+  
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++; 
+      while(buffer[i] != ','){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[1] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],',')){
+        return ParseStateError::no_comma;
+      } 
+      i++;
+   
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[2] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+    
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+     
+      if(!is_expectedChar(buffer[i],'b')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+     
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[3] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      while(buffer[i] != '\n'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[4] = intBuff2Int(intBuffInx-1);
+      newCRC = CRC8.smbus(buffer,i-intBuffInx); //CRC generated by received string
+      Serial.print("number:");
+      Serial.println(attriValue[0]);
+      Serial.print("posE_cm:");
+      Serial.println(attriValue[1]);
+      Serial.print("posN_cm:");
+      Serial.println(attriValue[2]);
+      Serial.print("bearing_deg:");
+      Serial.println(attriValue[3]);
+      Serial.print("old CRC:");
+      Serial.println(attriValue[4]);
+      Serial.println(newCRC);
+      Serial.print("newCRC:");
+      Serial.println(newCRC);
+      intBuffInx = 0;
+
+      if(attriValue[4] == newCRC){
+        dt->number = attriValue[0];
+        dt->posE_cm = attriValue[1];
+        dt->posN_cm = attriValue[2];
+        dt->bearing_deg = attriValue[3];
+        dt->crc = newCRC;
+      }else{
+        return ParseStateError::inval_comb;
+      }
+
+      if(is_expectedChar(buffer[i],'\n')){
+        return ParseStateError::success;
+      }else{
+        return ParseStateError::inval_comb; 
+      }  
+  }
+  ParseStateError ParseState::checkSensor(void){
+    //check the sensor string as S{s speed_cmPS}{p posE_cm,posN_cm}{b bearing_deg}{a angle_mDeg}CRC\n
+    #pragma region 
+      Serial.println("Check Sensor");
+      dt->kind = MsgType::sensor;
+      i =1;
+      Serial.println(i);
+      //check_CurlyPack(1,'s');++++++++++++++++++++++++++
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      Serial.println(i);
+      if(!is_expectedChar(buffer[i],'s')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      Serial.println(i);
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      Serial.println(i);
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }  //checking "S{s speed_cmPS" then store speed_cmPs
+    #pragma endregion
+      attriValue[0] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+    
+       // check_CurlyPack(temp,'p'); 
+      //+++++++++++++++++++++++++
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'p')){
+
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      Serial.println(i);
+      while(buffer[i] != ','){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;     
+      }  //checking "}{p posE_cm" then store posE_cm
+    #pragma endregion
+      attriValue[1] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region 
+      if(!is_expectedChar(buffer[i],',')){
+        return ParseStateError::no_comma;//
+      }
+      i++;
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }  //checking ",posN_cm" then store posN_cm
+    #pragma endregion
+      attriValue[2]= intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+    
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+     
+      if(!is_expectedChar(buffer[i],'b')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+   
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      } //checking "}{b bearing_deg" then store bearing_deg
+    #pragma endregion
+      attriValue[3] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'a')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+        
+      } //checking "}{a angle_mDeg" then store angle_mDeg
+    #pragma endregion
+      attriValue[4] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      ///check CRC num & end 
+      while(buffer[i] != '\n'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          Serial.println(buffer[i]);
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      } //checking "}CRC" then store CRC 
+    #pragma endregion
+      attriValue[5] = intBuff2Int(intBuffInx-1);
+
+      /*GENERATE NEW CRC FROM RECEIVED STRING*/
+      newCRC = CRC8.smbus(buffer,i-intBuffInx); 
+      Serial.println(newCRC);
+      intBuffInx = 0;
+
+      /*CHECK CRC & ASSIGN VALUES OF ATTRIBUTE*/
+      if(attriValue[5] == newCRC){
+        dt->speed_cmPs = attriValue[0];
+        dt->posE_cm = attriValue[1];
+        dt->posN_cm = attriValue[2];
+        dt->bearing_deg = attriValue[3];
+        dt->angle_mDeg = attriValue[4];
+        dt->crc = newCRC;
+      }else{
+        return ParseStateError::inval_comb;
+      }
+
+      /*FINAL CHECK*/
+      if(is_expectedChar(buffer[i],'\n')){
+        return ParseStateError::success;
+      }else{
+        return ParseStateError::inval_comb; 
+      }  
+  }
+  ParseStateError ParseState::checkSeg(void){
+    //check the seg string as X{n number}{p posE_cm,posN_cm}{b bearing_deg}{a angle_mDeg}CRC\n
+    #pragma region         //checking till number 
+      Serial.println("Check Seg");
+      dt->kind = MsgType::seg;
+      i =1;
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'n')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;;
+      }
+    #pragma endregion
+      attriValue[0] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],'p')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      while(buffer[i] != ','){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }   //checking till posE_cm
+    #pragma endregion
+      attriValue[1] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+    
+    #pragma region     //checking till posN_cm
+      if(!is_expectedChar(buffer[i],',')){
+        return ParseStateError::no_comma;//
+      }
+     
+      i++;
+      Serial.println(i);
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++;
+      }
+    #pragma endregion
+      attriValue[2] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+  
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'b')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+   
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++; 
+      }  //check till bearing_deg
+    #pragma endregion
+      attriValue[3]= intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'{')) {
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+
+      if(!is_expectedChar(buffer[i],'a')){
+        return ParseStateError::bad_attrib;
+      }
+      i++;
+ 
+      if(!is_expectedChar(buffer[i],' ')){
+        return ParseStateError::no_space;
+      }
+      i++;
+      while(buffer[i] != '}'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++; 
+      }
+    #pragma endregion
+      attriValue[4] = intBuff2Int(intBuffInx-1);
+      intBuffInx =0;
+
+    #pragma region
+      if(!is_expectedChar(buffer[i],'}')){
+        return ParseStateError::bad_lcurly;
+      }
+      i++;
+      while(buffer[i] != '\n'){
+        intBuffer[intBuffInx] = char2Int(buffer[i]);
+        if(!is_Number(buffer[i])){
+          return ParseStateError::bad_number;
+        }
+        i++;
+        intBuffInx++; 
+      }
+    #pragma endregion
+      attriValue[5]= intBuff2Int(intBuffInx-1);
+
+      /*GENERATE NEW CRC FROM RECEIVED STRING*/
+      newCRC = CRC8.smbus(buffer,i-intBuffInx); 
+      Serial.println(newCRC);
+      intBuffInx = 0;
+
+      /*CHECK CRC & ASSIGN VALUES OF ATTRIBUTE*/
+      if(attriValue[5] == newCRC){
+        dt->number = attriValue[0];
+        dt->posE_cm = attriValue[1];
+        dt->posN_cm = attriValue[2];
+        dt->bearing_deg = attriValue[3];
+        dt->angle_mDeg = attriValue[4];
+        dt->crc = newCRC;
+      }else{
+        return ParseStateError::inval_comb;
+      }
+
+      if(is_expectedChar(buffer[i],'\n')){
+        return ParseStateError::success;
+      }else{
+        return ParseStateError::inval_comb; 
+      }  
+  }
 } // namespace elcano
